@@ -32,6 +32,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/GoogleCloudPlatform/cloudsql-proxy/internal/observability"
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/logging"
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/certs"
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/fuse"
@@ -85,6 +86,21 @@ You may set the GOOGLE_APPLICATION_CREDENTIALS environment variable for the same
 
 	// Setting to choose what API to connect to
 	host = flag.String("host", "https://www.googleapis.com/sql/v1beta4/", "When set, the proxy uses this host as the base API path.")
+	// Settings for observability
+	observabilityConfig = flag.String("observability", "", "if set, enables observability with OpenCensus of the form:\n\t<samplingRate>;[<exporter>:<key>=<value>],[<exporter>:<key>=<value>]"+
+		"\nFor example:\n\tobservability=0.9;stackdriver:tracing=true:monitoring=true:metric-prefix=flux")
+
+	// Set to non-default value when gcloud execution failed.
+	gcloudStatus gcloudStatusCode
+)
+
+type gcloudStatusCode int
+
+const (
+	gcloudOk gcloudStatusCode = iota
+	gcloudNotFound
+	// generic execution failure error not specified above.
+	gcloudExecErr
 )
 
 const (
@@ -255,7 +271,18 @@ func checkFlags(onGCE bool) error {
 	return nil
 }
 
-func authenticatedClient(ctx context.Context) (*http.Client, error) {
+func authenticatedClient(ctx context.Context, enableObservability bool) (*http.Client, error) {
+	hc, err := makeAuthenticatedClient(ctx)
+	if !enableObservability || err != nil {
+		return hc, err
+	}
+
+	// Otherwise, now instrument the HTTP client with OpenCensus by enabling the ochttp transport
+	hc.Transport = observability.InstrumentedTransportWithOpenCensus(hc.Transport)
+	return hc, nil
+}
+
+func makeAuthenticatedClient(ctx context.Context) (*http.Client, error) {
 	if f := *tokenFile; f != "" {
 		all, err := ioutil.ReadFile(f)
 		if err != nil {
@@ -420,8 +447,13 @@ func main() {
 		log.Fatal(err)
 	}
 
+	flusher, enableObservability, err := observability.ParseAndEnableObservabilityWithOpenCensus(*observabilityConfig, projList)
+	if err != nil {
+		log.Fatalf("Observability: %v", err)
+	}
+	defer flusher.Flush()
 	ctx := context.Background()
-	client, err := authenticatedClient(ctx)
+	client, err := authenticatedClient(ctx, enableObservability)
 	if err != nil {
 		log.Fatal(err)
 	}

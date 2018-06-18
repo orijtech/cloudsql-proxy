@@ -27,12 +27,16 @@ import (
 	"regexp"
 	"time"
 
+	"github.com/GoogleCloudPlatform/cloudsql-proxy/internal/observability"
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/proxy"
 	"github.com/lib/pq"
 )
 
+var dbDriverName string
+
 func init() {
-	sql.Register("cloudsqlpostgres", &drv{})
+	dbDriverName, _ = observability.MakeInstrumentedDBName("cloudsqlpostgres")
+	sql.Register(dbDriverName, &drv{})
 }
 
 type drv struct{}

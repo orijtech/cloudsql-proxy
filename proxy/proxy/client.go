@@ -24,7 +24,14 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/net/context"
+
+	"github.com/GoogleCloudPlatform/cloudsql-proxy/internal/observability"
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/logging"
+
+	"go.opencensus.io/stats"
+	"go.opencensus.io/tag"
+	"go.opencensus.io/trace"
 )
 
 const (
@@ -111,6 +118,8 @@ func (c *Client) Run(connSrc <-chan Conn) {
 }
 
 func (c *Client) handleConn(conn Conn) {
+	// This method handles incoming connections that then are proxied/dialled-out to the CloudSQL instance.
+	ctx, _ := tag.New(context.Background(), tag.Insert(observability.KeyInstance, conn.Instance))
 	// Track connections count only if a maximum connections limit is set to avoid useless overhead
 	if c.MaxConnections > 0 {
 		active := atomic.AddUint64(&c.ConnectionsCounter, 1)
@@ -119,13 +128,15 @@ func (c *Client) handleConn(conn Conn) {
 		defer atomic.AddUint64(&c.ConnectionsCounter, ^uint64(0))
 
 		if active > c.MaxConnections {
+			ctx, _ = tag.New(ctx, tag.Upsert(observability.KeyReason, "too many connections"))
+			stats.Record(ctx, observability.MErrors.M(1))
 			logging.Errorf("too many open connections (max %d)", c.MaxConnections)
 			conn.Conn.Close()
 			return
 		}
 	}
 
-	server, err := c.Dial(conn.Instance)
+	server, err := c.DialContext(ctx, conn.Instance)
 	if err != nil {
 		logging.Errorf("couldn't connect to %q: %v", conn.Instance, err)
 		conn.Conn.Close()
@@ -149,7 +160,10 @@ func (c *Client) handleConn(conn Conn) {
 // refreshCfg uses the CertSource inside the Client to find the instance's
 // address as well as construct a new tls.Config to connect to the instance. It
 // caches the result.
-func (c *Client) refreshCfg(instance string) (addr string, cfg *tls.Config, err error) {
+func (c *Client) refreshCfg(ctx context.Context, instance string) (addr string, cfg *tls.Config, err error) {
+	startTime := time.Now()
+	var remoteCertFetchDuration, localCertFetchDuration time.Duration
+
 	c.cfgL.Lock()
 	defer c.cfgL.Unlock()
 
@@ -158,9 +172,28 @@ func (c *Client) refreshCfg(instance string) (addr string, cfg *tls.Config, err 
 		throttle = DefaultRefreshCfgThrottle
 	}
 
+	ctx, _ = tag.New(ctx, tag.Upsert(observability.KeyMethod, "refreshCfg"), tag.Upsert(observability.KeyPhase, "certRefresh"))
+	var metrics []stats.Measurement
+
+	defer func() {
+		metrics = append(metrics, observability.MLatencyMs.M(observability.SinceInMilliseconds(startTime)))
+		stats.Record(ctx, metrics...)
+
+		// Now separately record the latencies for the two types of certificates' refresh latencies
+		if remoteCertFetchDuration > 0 {
+			rctx, _ := tag.New(ctx, tag.Upsert(observability.KeyCertType, "remote"))
+			stats.Record(rctx, observability.MCertRefreshLatencyMs.M(observability.ToMilliseconds(remoteCertFetchDuration)))
+		}
+		if localCertFetchDuration > 0 {
+			lctx, _ := tag.New(ctx, tag.Upsert(observability.KeyCertType, "local"))
+			stats.Record(lctx, observability.MCertRefreshLatencyMs.M(observability.ToMilliseconds(localCertFetchDuration)))
+		}
+	}()
+
 	if old := c.cfgCache[instance]; time.Since(old.lastRefreshed) < throttle {
 		logging.Errorf("Throttling refreshCfg(%s): it was only called %v ago", instance, time.Since(old.lastRefreshed))
 		// Refresh was called too recently, just reuse the result.
+		ctx, _ = tag.New(ctx, tag.Upsert(observability.KeyConnectionState, "reused"), tag.Upsert(observability.KeyThrottled, "true"))
 		return old.addr, old.cfg, old.err
 	}
 
@@ -178,17 +211,30 @@ func (c *Client) refreshCfg(instance string) (addr string, cfg *tls.Config, err 
 		}
 	}()
 
-	mycert, err := c.Certs.Local(instance)
+	var mycert tls.Certificate
+	localCertFetchDuration = timed(func() {
+		mycert, err = c.Certs.Local(instance)
+	})
 	if err != nil {
+		ctx, _ = tag.New(ctx, tag.Upsert(observability.KeyCertType, "local"), tag.Upsert(observability.KeyReason, err.Error()))
+		metrics = append(metrics, observability.MErrors.M(1))
 		return "", nil, err
 	}
 
-	scert, addr, name, err := c.Certs.Remote(instance)
+	var name string
+	var scert *x509.Certificate
+	remoteCertFetchDuration = timed(func() {
+		scert, addr, name, err = c.Certs.Remote(instance)
+	})
 	if err != nil {
+		ctx, _ = tag.New(ctx, tag.Upsert(observability.KeyCertType, "remote"), tag.Upsert(observability.KeyReason, err.Error()))
+		metrics = append(metrics, observability.MErrors.M(1))
 		return "", nil, err
 	}
 	certs := x509.NewCertPool()
 	certs.AddCert(scert)
+	// TODO: add the certificate type
+	metrics = append(metrics, observability.MCertsAdded.M(1))
 
 	cfg = &tls.Config{
 		ServerName:   name,
@@ -233,6 +279,12 @@ func genVerifyPeerCertificateFunc(instanceName string, pool *x509.CertPool) func
 	}
 }
 
+func timed(fn func()) time.Duration {
+	start := time.Now()
+	fn()
+	return time.Since(start)
+}
+
 func (c *Client) cachedCfg(instance string) (string, *tls.Config) {
 	c.cfgL.RLock()
 	ret, ok := c.cfgCache[instance]
@@ -249,28 +301,80 @@ func (c *Client) cachedCfg(instance string) (string, *tls.Config) {
 // If this func returns a nil error the connection is correctly authenticated
 // to connect to the instance.
 func (c *Client) Dial(instance string) (net.Conn, error) {
+	return c.DialContext(context.Background(), instance)
+}
+
+func (c *Client) DialContext(ctx context.Context, instance string) (net.Conn, error) {
+	// Start tracing and metrics collection.
+	ctx, _ = tag.New(ctx, tag.Upsert(observability.KeyInstance, instance), tag.Upsert(observability.KeyMethod, "dial"))
+	ctx, span := trace.StartSpan(ctx, "proxy.(*Client).DialContext")
+
+	metrics := make([]stats.Measurement, 0, 5)
+	dialStartTime := time.Now()
+	defer func() {
+		mLatency := observability.MLatencyMs.M(observability.SinceInMilliseconds(dialStartTime))
+		metrics = append(metrics, mLatency)
+		stats.Record(ctx, metrics...)
+		span.End()
+	}()
+
 	if addr, cfg := c.cachedCfg(instance); cfg != nil {
-		ret, err := c.tryConnect(addr, cfg)
+		ctx, ret, err := c.tryConnect(ctx, addr, cfg)
 		if err == nil {
-			return ret, err
+			ctx, _ = tag.New(ctx,
+				tag.Upsert(observability.KeyConnectionState, "reused"),
+				tag.Upsert(observability.KeyThrottled, "true"),
+				tag.Upsert(observability.KeyStatus, "success"))
+
+			metrics = append(metrics, observability.MOutboundConnections.M(1))
+			return ret, nil
+		} else {
+			ctx, _ = tag.New(ctx,
+				tag.Upsert(observability.KeyPhase, "cachedCfg"),
+				tag.Upsert(observability.KeyReason, err.Error()),
+				tag.Insert(observability.KeyStatus, "error"))
+
+			metrics = append(metrics, observability.MErrors.M(1), observability.MOutboundConnections.M(1))
 		}
 	}
 
-	addr, cfg, err := c.refreshCfg(instance)
+	addr, cfg, err := c.refreshCfg(ctx, instance)
 	if err != nil {
+		span.SetStatus(trace.Status{Code: trace.StatusCodeInternal, Message: err.Error()})
 		return nil, err
 	}
-	return c.tryConnect(addr, cfg)
+
+	var conn net.Conn
+	ctx, conn, err = c.tryConnect(ctx, addr, cfg)
+	if err == nil {
+		ctx, _ = tag.New(ctx,
+			tag.Upsert(observability.KeyConnectionState, "new"),
+			tag.Upsert(observability.KeyStatus, "success"))
+
+		metrics = append(metrics, observability.MOutboundConnections.M(1))
+	} else {
+		ctx, _ = tag.New(ctx,
+			tag.Upsert(observability.KeyPhase, "tryConnect"),
+			tag.Upsert(observability.KeyReason, err.Error()),
+			tag.Insert(observability.KeyStatus, "error"))
+
+		metrics = append(metrics, observability.MErrors.M(1), observability.MOutboundConnections.M(1))
+		span.SetStatus(trace.Status{Code: trace.StatusCodeInternal, Message: err.Error()})
+	}
+	return conn, err
 }
 
-func (c *Client) tryConnect(addr string, cfg *tls.Config) (net.Conn, error) {
+// tryConnect passes back the context as the first return value because it can add tags indictive
+// of the phase that an error was encountered, without incrementing errors. This way its sole
+// consumer chooses to deal with errors and can selectively handle errors.
+func (c *Client) tryConnect(ctx context.Context, addr string, cfg *tls.Config) (context.Context, net.Conn, error) {
 	d := c.Dialer
 	if d == nil {
 		d = net.Dial
 	}
 	conn, err := d("tcp", addr)
 	if err != nil {
-		return nil, err
+		return ctx, nil, err
 	}
 	type setKeepAliver interface {
 		SetKeepAlive(keepalive bool) error
@@ -279,8 +383,10 @@ func (c *Client) tryConnect(addr string, cfg *tls.Config) (net.Conn, error) {
 
 	if s, ok := conn.(setKeepAliver); ok {
 		if err := s.SetKeepAlive(true); err != nil {
+			ctx, _ = tag.New(ctx, tag.Upsert(observability.KeyType, "keepalive"))
 			logging.Verbosef("Couldn't set KeepAlive to true: %v", err)
 		} else if err := s.SetKeepAlivePeriod(keepAlivePeriod); err != nil {
+			ctx, _ = tag.New(ctx, tag.Upsert(observability.KeyType, "keepalive_period"))
 			logging.Verbosef("Couldn't set KeepAlivePeriod to %v", keepAlivePeriod)
 		}
 	} else {
@@ -289,10 +395,11 @@ func (c *Client) tryConnect(addr string, cfg *tls.Config) (net.Conn, error) {
 
 	ret := tls.Client(conn, cfg)
 	if err := ret.Handshake(); err != nil {
+		ctx, _ = tag.New(ctx, tag.Upsert(observability.KeyType, "handshake"))
 		ret.Close()
-		return nil, err
+		return ctx, nil, err
 	}
-	return ret, nil
+	return ctx, ret, nil
 }
 
 // NewConnSrc returns a chan which can be used to receive connections
@@ -300,25 +407,42 @@ func (c *Client) tryConnect(addr string, cfg *tls.Config) (net.Conn, error) {
 // instance name provided here. The chan will be closed if the Listener returns
 // an error.
 func NewConnSrc(instance string, l net.Listener) <-chan Conn {
+	// This method handles incoming connections that then are proxied/dialled-out to the CloudSQL instance.
 	ch := make(chan Conn)
 	go func() {
+
 		for {
 			start := time.Now()
 			c, err := l.Accept()
+			// We'll record the number of connections received, with status of either:
+			//  * error
+			//  * success
+
+			ctx, _ := tag.New(context.Background(), tag.Insert(observability.KeyInstance, instance), tag.Insert(observability.KeyMethod, "listen"))
+
 			if err != nil {
 				logging.Errorf("listener (%#v) had error: %v", l, err)
+				ctx_, _ := tag.New(ctx, tag.Insert(observability.KeyStatus, "error"))
+				stats.Record(ctx, observability.MInboundConnections.M(1))
 				if nerr, ok := err.(net.Error); ok && nerr.Temporary() {
 					d := 10*time.Millisecond - time.Since(start)
 					if d > 0 {
 						time.Sleep(d)
 					}
+					ctx_, _ = tag.New(ctx_, tag.Upsert(observability.KeyType, "temporary"), tag.Upsert(observability.KeyReason, err.Error()))
+					stats.Record(ctx_, observability.MErrors.M(1))
 					continue
 				}
+				ctx_, _ = tag.New(ctx_, tag.Upsert(observability.KeyType, "permanent"), tag.Upsert(observability.KeyReason, err.Error()))
+				stats.Record(ctx_, observability.MErrors.M(1))
 				l.Close()
 				close(ch)
 				return
+			} else {
+				ch <- Conn{instance, c}
+				ctx, _ = tag.New(ctx, tag.Insert(observability.KeyStatus, "success"))
+				stats.Record(ctx, observability.MInboundConnections.M(1))
 			}
-			ch <- Conn{instance, c}
 		}
 	}()
 	return ch

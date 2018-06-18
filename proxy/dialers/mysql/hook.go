@@ -19,15 +19,25 @@
 package mysql
 
 import (
+	"context"
 	"database/sql"
 	"errors"
+	"time"
 
 	"github.com/GoogleCloudPlatform/cloudsql-proxy/proxy/proxy"
 	"github.com/go-sql-driver/mysql"
+
+	"github.com/GoogleCloudPlatform/cloudsql-proxy/internal/observability"
+	"go.opencensus.io/stats"
+	"go.opencensus.io/tag"
+	"go.opencensus.io/trace"
 )
+
+var dbDriverName string
 
 func init() {
 	mysql.RegisterDial("cloudsql", proxy.Dial)
+	dbDriverName, _ = observability.MakeInstrumentedDBName("mysql")
 }
 
 // Dial logs into the specified Cloud SQL Instance using the given user and no
@@ -76,9 +86,26 @@ func Cfg(instance, user, password string) *mysql.Config {
 //
 // The cfg.Addr should be the instance's connection string, in the format of:
 //	      project-name:region:instance-name.
-func DialCfg(cfg *mysql.Config) (*sql.DB, error) {
+func DialCfg(cfg *mysql.Config) (db *sql.DB, err error) {
+	ctx, _ := tag.New(context.Background(),
+		tag.Insert(observability.KeyInstance, cfg.Addr),
+		tag.Insert(observability.KeyDBType, "mysql"))
+
+	ctx, span := trace.StartSpan(ctx, "cloudsqlproxy/dialers/mysql/DialCfg")
+	startTime := time.Now()
+	defer func() {
+		ms := []stats.Measurement{observability.MDialLatencyMilliseconds.M(observability.SinceInMilliseconds(startTime)), observability.MDials.M(1)}
+		if err != nil {
+			ms = append(ms, observability.MErrorDial.M(1))
+			span.SetStatus(trace.Status{Code: trace.StatusCodeUnknown, Message: err.Error()})
+		}
+		stats.Record(ctx, ms...)
+		span.End()
+	}()
+
 	if cfg.TLSConfig != "" {
-		return nil, errors.New("do not specify TLS when using the Proxy")
+		err = errors.New("do not specify TLS when using the Proxy")
+		return
 	}
 
 	// Copy the config so that we can modify it without feeling bad.
@@ -86,9 +113,9 @@ func DialCfg(cfg *mysql.Config) (*sql.DB, error) {
 	c.Net = "cloudsql"
 	dsn := c.FormatDSN()
 
-	db, err := sql.Open("mysql", dsn)
+	db, err = sql.Open(dbDriverName, dsn)
 	if err == nil {
-		err = db.Ping()
+		err = db.PingContext(ctx)
 	}
-	return db, err
+	return
 }
